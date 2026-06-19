@@ -32,8 +32,8 @@ from .hand_control import (
     compute_handlebar_metrics,
     extract_hands,
     check_both_hands_open,
-    hand_openness_01,
 )
+from .gestures import GestureState
 from .message import ControlMessage, MessageValidator, create_control_message
 from .ws_client import WebSocketClient
 
@@ -71,12 +71,10 @@ class HandControlClient:
         rate: float = 25.0,  # 15 Hz is plenty for robot control
         show_preview: bool = False,
         invalid_timeout_ms: int = 300,
-        gripper_open_thresh: float = 0.75,
-        gripper_close_thresh: float = 0.45,
     ):
         """
         Initialize the hand control client.
-        
+
         Args:
             server_url: WebSocket server URL
             token: Authentication token
@@ -87,8 +85,6 @@ class HandControlClient:
             rate: Control loop rate (Hz)
             show_preview: Whether to show OpenCV preview window
             invalid_timeout_ms: Time before force-stop on invalid frames
-            gripper_open_thresh: Right-hand openness threshold to open gripper
-            gripper_close_thresh: Right-hand openness threshold to close gripper
         """
         self.server_url = server_url
         self.token = token
@@ -99,20 +95,12 @@ class HandControlClient:
         self.rate = rate
         self.show_preview = show_preview
         self.invalid_timeout_ms = invalid_timeout_ms
-        self.gripper_open_thresh = max(0.0, min(1.0, gripper_open_thresh))
-        self.gripper_close_thresh = max(0.0, min(1.0, gripper_close_thresh))
-        if self.gripper_close_thresh >= self.gripper_open_thresh:
-            self.gripper_close_thresh = max(0.0, self.gripper_open_thresh - 0.1)
-            logger.warning(
-                "gripper_close_thresh must be lower than gripper_open_thresh; "
-                "adjusted to %.2f",
-                self.gripper_close_thresh,
-            )
-        
+
         # Components
         self.frame_gate = FrameGate(invalid_timeout_ms=invalid_timeout_ms)
         self.mp_gate = MediaPipeGate()
         self.drive_state = DriveState()
+        self.gesture_state = GestureState()
         self.validator = MessageValidator(max_linear=max_linear, max_angular=max_angular)
         self.ws_client: Optional[WebSocketClient] = None
         
@@ -128,9 +116,7 @@ class HandControlClient:
         self._last_send_time = 0.0
         self._send_interval = 1.0 / rate
         self._force_stop_sent = False
-        self._gripper_state: Optional[int] = None
-        self._right_openness: Optional[float] = None
-        
+
         # UI font
         self.font = cv2.FONT_HERSHEY_SIMPLEX
         
@@ -206,8 +192,16 @@ class HandControlClient:
                 if key in (27, ord('q')):
                     logger.info("Quit requested")
                     self._running = False
+                elif key == ord(' '):
+                    # SPACE = emergency stop toggle. Keyboard, not a gesture: a
+                    # vision e-stop fails exactly when vision fails.
+                    self.gesture_state.estop = not self.gesture_state.estop
+                    self.gesture_state.last_event = "E-STOP" if self.gesture_state.estop else "E-STOP CLEARED"
+                    logger.warning(f"E-STOP {'ENGAGED' if self.gesture_state.estop else 'RELEASED'} (keyboard)")
                 elif key in (ord('e'), ord('E')):
                     self.drive_state.enabled = not self.drive_state.enabled
+                    if self.drive_state.enabled:
+                        self.gesture_state.estop = False  # enabling drive clears the latch
                     logger.info(f"Drive {'ENABLED' if self.drive_state.enabled else 'DISABLED'} (keyboard)")
                 elif key in (ord('c'), ord('C')):
                     self.drive_state.reset_calibration()
@@ -259,19 +253,17 @@ class HandControlClient:
         # Extract hand landmarks
         left, right = extract_hands(results)
         hands_ok = (left is not None) and (right is not None)
-        
-        # ====== RIGHT HAND GRIPPER (open/close) ======
-        self._right_openness = None
-        if right is not None:
-            self._right_openness = hand_openness_01(right[0].landmark)
-            if self._right_openness >= self.gripper_open_thresh:
-                self._gripper_state = 0
-            elif self._right_openness <= self.gripper_close_thresh:
-                self._gripper_state = 1
-        
+
         # ====== ARMING GESTURE (both hands open) ======
         both_open = check_both_hands_open(left, right)
+        prev_enabled = self.drive_state.enabled
         arming_progress = self.drive_state.update_arming(both_open)
+        # A rising edge on `enabled` means we just (re-)armed; that also clears a
+        # latched e-stop, so there's no separate "unstop" gesture.
+        rearmed = self.drive_state.enabled and not prev_enabled
+
+        # ====== DISCRETE GESTURE COMMANDS (mode / lane / e-stop) ======
+        self.gesture_state.update(left, right, dt, rearmed=rearmed)
         
         # ====== HAND QUALITY GATE + CONTROL COMPUTATION ======
         lost_active = self.drive_state.handle_visibility(hands_ok, dt)
@@ -349,13 +341,23 @@ class HandControlClient:
         if not can_enable:
             linear = 0.0
             angular = 0.0
-            
+
+        # E-stop override: while latched, force motion to zero and disable, on top
+        # of publishing the flag. Client-side effect — the raspi must honor estop
+        # too, but we don't wait for it to act.
+        if self.gesture_state.estop:
+            linear = 0.0
+            angular = 0.0
+            can_enable = False
+
         # Create message
         msg = create_control_message(
             linear=linear,
             angular=angular,
             enable=can_enable,
-            gripper=self._gripper_state,
+            mode=self.gesture_state.mode,
+            lane=self.gesture_state.lane,
+            estop=self.gesture_state.estop,
         )
         
         # Validate message
@@ -464,14 +466,16 @@ class HandControlClient:
         conn_color = (0, 255, 0) if conn_status == "Connected" else (0, 0, 255)
         cv2.putText(frame, f"Server: {conn_status}", (20, 70), self.font, 0.5, conn_color, 1)
 
-        # Gripper status
-        if self._gripper_state is None:
-            gripper_text = "Gripper: --"
-        else:
-            gripper_text = "Gripper: OPEN" if self._gripper_state == 0 else "Gripper: CLOSED"
-        if self._right_openness is not None:
-            gripper_text += f" ({self._right_openness:.2f})"
-        cv2.putText(frame, gripper_text, (20, 100), self.font, 0.5, (200, 200, 200), 1)
+        # Discrete-gesture state: mode / lane / e-stop
+        gs = self.gesture_state
+        mode_color = (0, 200, 255) if gs.mode == "onroad" else (180, 180, 180)
+        cv2.putText(frame, f"Mode: {gs.mode.upper()}", (20, 100), self.font, 0.5, mode_color, 1)
+        cv2.putText(frame, f"Lane: {gs.lane.upper()}", (20, 125), self.font, 0.5, mode_color, 1)
+        if gs.estop:
+            # Loud, centered banner — this is the one you must not miss.
+            cv2.putText(frame, "*** E-STOP ***", (w // 2 - 120, 50), self.font, 1.0, (0, 0, 255), 3)
+        if gs.last_event:
+            cv2.putText(frame, gs.last_event, (20, 150), self.font, 0.5, (0, 255, 0), 1)
         
         # Command display
         linear, angular = self.drive_state.get_velocity_commands(self.max_linear, self.max_angular)
@@ -550,8 +554,6 @@ async def main_async(args: argparse.Namespace) -> None:
         rate=args.rate,
         show_preview=args.preview,
         invalid_timeout_ms=args.invalid_timeout,
-        gripper_open_thresh=args.gripper_open_thresh,
-        gripper_close_thresh=args.gripper_close_thresh,
     )
     
     # Handle shutdown signals (Unix only - Windows uses KeyboardInterrupt)
@@ -637,18 +639,6 @@ def main() -> None:
         type=int,
         default=300,
         help="Timeout (ms) before force-stop on invalid frames",
-    )
-    parser.add_argument(
-        "--gripper-open-thresh",
-        type=float,
-        default=0.75,
-        help="Right-hand openness (0-1) threshold to open gripper",
-    )
-    parser.add_argument(
-        "--gripper-close-thresh",
-        type=float,
-        default=0.45,
-        help="Right-hand openness (0-1) threshold to close gripper",
     )
     parser.add_argument(
         "--debug",

@@ -24,34 +24,43 @@ class ControlMessage:
         linear: Linear velocity in m/s (forward positive)
         angular: Angular velocity in rad/s (counter-clockwise positive)
         enable: Whether drive is enabled
-        gripper: Optional gripper command (0=open, 1=closed)
+        mode: Optional drive mode ("onroad"=ADAS / "offroad"=manual)
+        lane: Optional target lane ("left" / "center" / "right")
+        estop: Optional emergency-stop flag (latched until re-arm)
         ts_ms: Timestamp in milliseconds (monotonic)
     """
     linear: float
     angular: float
     enable: bool
     ts_ms: int
-    gripper: Optional[int] = None
-    
+    mode: Optional[str] = None
+    lane: Optional[str] = None
+    estop: Optional[bool] = None
+
     def to_json(self) -> str:
         """Serialize to JSON string."""
         payload = asdict(self)
-        if payload.get("gripper") is None:
-            payload.pop("gripper", None)
+        # Drop optional keys that aren't set, so the wire payload stays lean and
+        # consumers that don't know a field simply never see it.
+        for key in ("mode", "lane", "estop"):
+            if payload.get(key) is None:
+                payload.pop(key, None)
         return json.dumps(payload)
     
     @classmethod
     def from_json(cls, data: str) -> 'ControlMessage':
         """Deserialize from JSON string."""
         d = json.loads(data)
-        gripper = d.get("gripper", None)
-        if gripper is not None:
-            gripper = int(gripper)
+        estop = d.get("estop", None)
+        if estop is not None:
+            estop = bool(estop)
         return cls(
             linear=float(d['linear']),
             angular=float(d['angular']),
             enable=bool(d['enable']),
-            gripper=gripper,
+            mode=d.get("mode", None),
+            lane=d.get("lane", None),
+            estop=estop,
             ts_ms=int(d['ts_ms']),
         )
     
@@ -62,7 +71,6 @@ class ControlMessage:
             linear=0.0,
             angular=0.0,
             enable=False,
-            gripper=None,
             ts_ms=int(time.monotonic() * 1000),
         )
 
@@ -147,12 +155,24 @@ class MessageValidator:
             logger.warning(f"Invalid message: enable={msg.enable} is not boolean")
             return False, "enable_not_boolean"
 
-        # Check 7: gripper command (if provided) is 0 or 1
-        if msg.gripper is not None and msg.gripper not in (0, 1):
+        # Check 7: discrete-gesture fields (if provided) are in their allowed sets.
+        # Literals mirror gestures.py (kept here to avoid the schema layer
+        # depending on the gesture layer).
+        if msg.mode is not None and msg.mode not in ("onroad", "offroad"):
             self._dropped_count += 1
-            logger.warning(f"Invalid message: gripper={msg.gripper} is not 0/1")
-            return False, "gripper_not_valid"
-        
+            logger.warning(f"Invalid message: mode={msg.mode} is not onroad/offroad")
+            return False, "mode_not_valid"
+
+        if msg.lane is not None and msg.lane not in ("left", "center", "right"):
+            self._dropped_count += 1
+            logger.warning(f"Invalid message: lane={msg.lane} is not left/center/right")
+            return False, "lane_not_valid"
+
+        if msg.estop is not None and not isinstance(msg.estop, bool):
+            self._dropped_count += 1
+            logger.warning(f"Invalid message: estop={msg.estop} is not boolean")
+            return False, "estop_not_boolean"
+
         # All checks passed
         self._last_ts = msg.ts_ms
         self._validated_count += 1
@@ -172,15 +192,13 @@ class MessageValidator:
             Tuple of (clamped_message, is_valid, reason)
         """
         # Clamp values
-        gripper = msg.gripper
-        if gripper is not None:
-            gripper = 1 if int(gripper) != 0 else 0
-
         clamped = ControlMessage(
             linear=max(-self.max_linear, min(self.max_linear, msg.linear)),
             angular=max(-self.max_angular, min(self.max_angular, msg.angular)),
             enable=msg.enable,
-            gripper=gripper,
+            mode=msg.mode,
+            lane=msg.lane,
+            estop=msg.estop,
             ts_ms=msg.ts_ms,
         )
         
@@ -213,17 +231,21 @@ def create_control_message(
     linear: float,
     angular: float,
     enable: bool,
-    gripper: Optional[int] = None,
+    mode: Optional[str] = None,
+    lane: Optional[str] = None,
+    estop: Optional[bool] = None,
 ) -> ControlMessage:
     """
     Create a control message with current timestamp.
-    
+
     Args:
         linear: Linear velocity in m/s
         angular: Angular velocity in rad/s
         enable: Whether drive is enabled
-        gripper: Optional gripper command (0=open, 1=closed)
-        
+        mode: Optional drive mode ("onroad"/"offroad")
+        lane: Optional target lane ("left"/"center"/"right")
+        estop: Optional emergency-stop flag
+
     Returns:
         ControlMessage instance
     """
@@ -231,7 +253,9 @@ def create_control_message(
         linear=linear,
         angular=angular,
         enable=enable,
-        gripper=gripper,
+        mode=mode,
+        lane=lane,
+        estop=estop,
         ts_ms=int(time.monotonic() * 1000),
     )
 

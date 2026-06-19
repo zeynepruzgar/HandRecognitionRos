@@ -15,6 +15,7 @@ import numpy as np
 # ============================================================================
 
 WRIST = 0
+THUMB_CMC, THUMB_MCP, THUMB_IP, THUMB_TIP = 1, 2, 3, 4
 INDEX_MCP, INDEX_PIP, INDEX_DIP, INDEX_TIP = 5, 6, 7, 8
 MIDDLE_MCP, MIDDLE_PIP, MIDDLE_DIP, MIDDLE_TIP = 9, 10, 11, 12
 RING_MCP, RING_PIP, RING_DIP, RING_TIP = 13, 14, 15, 16
@@ -137,10 +138,31 @@ def finger_openness_01(f: Dict[str, float]) -> float:
     return _map01(f["tip_palm_n"], 0.50, 0.90)
 
 
+def per_finger_openness(lm) -> Dict[str, float]:
+    """Openness (0=closed, 1=open) per finger: index, middle, ring, pinky.
+
+    Public accessor so discrete-gesture detection (gestures.py) can reuse the
+    exact same openness math instead of re-deriving it and drifting from the
+    driving logic.
+    """
+    feats = _all_finger_feats(lm)
+    return {name: finger_openness_01(f) for name, f in feats.items()}
+
+
+def thumb_openness_01(lm) -> float:
+    """Thumb extension (0=tucked into fist, 1=sticking out).
+
+    The thumb isn't part of _all_finger_feats (it doesn't matter for the
+    handlebar metaphor), so it gets its own mapping. The 0.45..0.75 band is
+    tuned for the thumb being a shorter digit than the fingers.
+    """
+    ref = _hand_size_ref(lm)
+    return _map01(_tip_palm_dist(lm, THUMB_TIP) / ref, 0.45, 0.75)
+
+
 def hand_openness_01(lm) -> float:
     """Calculate overall hand openness."""
-    feats = _all_finger_feats(lm)
-    vals = [finger_openness_01(f) for f in feats.values()]
+    vals = list(per_finger_openness(lm).values())
     return float(np.mean(vals)) if vals else 0.0
 
 
