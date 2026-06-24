@@ -25,7 +25,6 @@ from typing import Optional
 import cv2
 import mediapipe as mp
 import numpy as np
-from pynput import keyboard
 
 from .frame_gate import FrameGate, MediaPipeGate
 from .hand_control import (
@@ -125,55 +124,10 @@ class HandControlClient:
         # UI font
         self.font = cv2.FONT_HERSHEY_SIMPLEX
 
-        # Keyboard state
-        self._keyboard_listener = None
+        # Keyboard state. Single input path: cv2.waitKey in the preview loop.
+        # (pynput was removed — it duplicated every keypress and needs macOS
+        # accessibility perms. Click the preview window to give it focus.)
         self._last_key_pressed = None
-        self._lane_left_armed = False
-        self._lane_right_armed = False
-
-    def _on_key_press(self, key):
-        """Handle keyboard input (non-blocking via pynput)."""
-        try:
-            self._last_key_pressed = str(key).replace("Key.", "").replace("'", "")
-
-            if key == keyboard.Key.enter:
-                self._send_raw_command("MODE_TOGGLE")
-            elif key == keyboard.Key.space:
-                self._send_raw_command("ESTOP")
-            elif key == keyboard.Key.up:
-                self._lane_left_armed = True
-            elif key == keyboard.Key.down:
-                self._lane_right_armed = True
-            elif key == keyboard.Key.left:
-                self._send_raw_command("CMD_A")
-            elif key == keyboard.Key.right:
-                self._send_raw_command("CMD_D")
-            else:
-                # Check character keys (WASD)
-                char = key.char if hasattr(key, 'char') else None
-                if char == 'w':
-                    self._send_raw_command("CMD_W")
-                elif char == 'a':
-                    self._send_raw_command("CMD_A")
-                elif char == 's':
-                    self._send_raw_command("CMD_S")
-                elif char == 'd':
-                    self._send_raw_command("CMD_D")
-        except AttributeError:
-            pass
-
-    def _on_key_release(self, key):
-        """Detect lane change on key release (edge-triggered)."""
-        try:
-            if key == keyboard.Key.up and self._lane_left_armed:
-                self._send_raw_command("LANE_LEFT")
-                self._lane_left_armed = False
-            elif key == keyboard.Key.down and self._lane_right_armed:
-                self._send_raw_command("LANE_RIGHT")
-                self._lane_right_armed = False
-            self._last_key_pressed = None
-        except AttributeError:
-            pass
 
     def _send_raw_command(self, cmd: str):
         """Send a raw command string directly to the rover."""
@@ -202,13 +156,6 @@ class HandControlClient:
         self.publisher = UdpPublisher(self.host, self.port)
         self.publisher.start()
 
-        # Start keyboard listener
-        self._keyboard_listener = keyboard.Listener(
-            on_press=self._on_key_press,
-            on_release=self._on_key_release
-        )
-        self._keyboard_listener.start()
-
         self._running = True
         logger.info("Hand Control Client started")
 
@@ -216,10 +163,6 @@ class HandControlClient:
         """Stop the client and clean up resources."""
         logger.info("Stopping Hand Control Client...")
         self._running = False
-
-        # Stop keyboard listener
-        if self._keyboard_listener:
-            self._keyboard_listener.stop()
 
         # Send a final STOP, then shut the publisher down.
         if self.publisher:
@@ -257,6 +200,14 @@ class HandControlClient:
             # Handle OpenCV window events
             if self.show_preview:
                 key = cv2.waitKey(1) & 0xFF
+                # Show what was pressed in the overlay (255 = no key this frame).
+                key_names = {
+                    ord(' '): "SPACE", ord('m'): "M", ord('e'): "E", ord('c'): "C",
+                    ord('w'): "W", ord('a'): "A", ord('s'): "S", ord('d'): "D",
+                    82: "UP", 84: "DOWN", 81: "LEFT", 83: "RIGHT",
+                }
+                if key != 255:
+                    self._last_key_pressed = key_names.get(key, chr(key) if 32 <= key < 127 else str(key))
                 if key in (27, ord('q')):
                     logger.info("Quit requested")
                     self._running = False
