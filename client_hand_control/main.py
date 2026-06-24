@@ -102,7 +102,10 @@ class HandControlClient:
         self.frame_gate = FrameGate(invalid_timeout_ms=invalid_timeout_ms)
         self.mp_gate = MediaPipeGate()
         self.drive_state = DriveState()
-        self.gesture_state = GestureState()
+        # fist_thresh: four fingers must be folded below this. open_thresh: thumb
+        # extension above this counts as "thumb out" (thumbs-up, and the line that
+        # separates a fist from a thumbs-up). See is_fist/is_thumb_up in gestures.py.
+        self.gesture_state = GestureState(fist_thresh=0.35, open_thresh=0.55)
         self.validator = MessageValidator()
         self.publisher: Optional[UdpPublisher] = None
         
@@ -263,6 +266,12 @@ class HandControlClient:
                     self.gesture_state.estop = not self.gesture_state.estop
                     self.gesture_state.last_event = "E-STOP" if self.gesture_state.estop else "E-STOP CLEARED"
                     logger.warning(f"E-STOP {'ENGAGED' if self.gesture_state.estop else 'RELEASED'} (keyboard)")
+                elif key in (ord('m'), ord('M')):
+                    # M = mode toggle (ON_ROAD <-> OFF_ROAD)
+                    self.gesture_state.mode = "onroad" if self.gesture_state.mode == "offroad" else "offroad"
+                    self.gesture_state.last_event = f"MODE {self.gesture_state.mode.upper()}"
+                    self._send_raw_command("MODE_TOGGLE")
+                    logger.info(f"Mode toggle: {self.gesture_state.mode}")
                 elif key in (ord('e'), ord('E')):
                     self.drive_state.enabled = not self.drive_state.enabled
                     if self.drive_state.enabled:
@@ -272,6 +281,22 @@ class HandControlClient:
                     self.drive_state.reset_calibration()
                     self.drive_state.calib_requested = True
                     logger.info("Calibration reset requested")
+                elif key == ord('w'):
+                    self._send_raw_command("CMD_W")
+                elif key == ord('a'):
+                    self._send_raw_command("CMD_A")
+                elif key == ord('s'):
+                    self._send_raw_command("CMD_S")
+                elif key == ord('d'):
+                    self._send_raw_command("CMD_D")
+                elif key == 82:  # Up arrow
+                    self._send_raw_command("LANE_LEFT")
+                elif key == 84:  # Down arrow
+                    self._send_raw_command("LANE_RIGHT")
+                elif key == 81:  # Left arrow
+                    self._send_raw_command("CMD_A")
+                elif key == 83:  # Right arrow
+                    self._send_raw_command("CMD_D")
                     
             # Rate limiting
             elapsed = time.time() - loop_start
@@ -491,6 +516,34 @@ class HandControlClient:
 
         run_color = (0, 255, 0) if gs.run else (0, 0, 255)
         cv2.putText(frame, f"RUN: {'ON' if gs.run else 'OFF'}", (20, 125), self.font, 0.5, run_color, 1)
+
+        # Gesture detection debug: show what poses are detected
+        if hands_ok and left and right:
+            from .gestures import is_fist, is_thumb_up
+            from .hand_control import hand_openness_01, thumb_openness_01
+            l_lm = left[0].landmark
+            r_lm = right[0].landmark
+
+            l_open = hand_openness_01(l_lm)
+            r_open = hand_openness_01(r_lm)
+            l_thumb_open = thumb_openness_01(l_lm)
+            r_thumb_open = thumb_openness_01(r_lm)
+
+            l_fist = is_fist(l_lm, gs.fist_thresh, gs.open_thresh)
+            r_fist = is_fist(r_lm, gs.fist_thresh, gs.open_thresh)
+            l_thumb = is_thumb_up(l_lm, gs.fist_thresh, gs.open_thresh)
+            r_thumb = is_thumb_up(r_lm, gs.fist_thresh, gs.open_thresh)
+
+            gesture_text = f"L:{'F' if l_fist else 'T' if l_thumb else '.'} R:{'F' if r_fist else 'T' if r_thumb else '.'}"
+            cv2.putText(frame, gesture_text, (w - 150, 30), self.font, 0.6, (200, 200, 200), 1)
+
+            # Show actual values
+            openness_text = f"L: {l_open:.2f} ({l_thumb_open:.2f}) R: {r_open:.2f} ({r_thumb_open:.2f})"
+            cv2.putText(frame, openness_text, (w - 300, 50), self.font, 0.4, (150, 150, 150), 1)
+
+            # Show thresholds
+            thresh_text = f"Fist<{gs.fist_thresh:.2f} Thumb>{gs.open_thresh:.2f}"
+            cv2.putText(frame, thresh_text, (w - 300, 65), self.font, 0.4, (100, 100, 100), 1)
 
         # Lane change state
         if gs.lane_change:

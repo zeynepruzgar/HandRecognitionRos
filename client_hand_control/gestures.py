@@ -36,9 +36,17 @@ MODE_OFFROAD = "offroad"  # manual
 # Pose detectors (pure functions on a landmark list)
 # ============================================================================
 
-def is_fist(lm, thresh: float) -> bool:
-    """All four fingers folded into a fist."""
-    return hand_openness_01(lm) <= thresh
+def is_fist(lm, fist_thresh: float, thumb_thresh: float) -> bool:
+    """A real fist: all four fingers folded AND the thumb tucked.
+
+    The thumb-tuck check is what makes a fist distinct from a thumbs-up. Without
+    it, a thumbs-up (fingers folded, thumb out) also reads as a fist, because
+    hand_openness_01 only averages the four fingers and ignores the thumb — so
+    both gestures would cross-fire. Mutually exclusive by construction:
+      fist      = fingers folded + thumb tucked  (thumb < thumb_thresh)
+      thumbs-up = fingers folded + thumb out      (thumb >= thumb_thresh)
+    """
+    return hand_openness_01(lm) <= fist_thresh and thumb_openness_01(lm) < thumb_thresh
 
 
 def is_thumb_up(lm, fist_thresh: float, open_thresh: float) -> bool:
@@ -147,8 +155,8 @@ class GestureState:
 
         # START/STOP autonomy: both fists. Distinct from open palms (arming),
         # thumbs-up (mode), and pointing (lane), so no cross-fire.
-        l_fist = l_lm is not None and is_fist(l_lm, self.fist_thresh)
-        r_fist = r_lm is not None and is_fist(r_lm, self.fist_thresh)
+        l_fist = l_lm is not None and is_fist(l_lm, self.fist_thresh, self.open_thresh)
+        r_fist = r_lm is not None and is_fist(r_lm, self.fist_thresh, self.open_thresh)
         if self._edge("run", l_fist and r_fist, dt, self.trigger_hold):
             self.run = not self.run
             self.last_event = f"RUN {'ON' if self.run else 'OFF'}"
