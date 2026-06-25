@@ -231,7 +231,7 @@ class HandControlClient:
                     # M = mode toggle (ON_ROAD <-> OFF_ROAD)
                     self.gesture_state.mode = "onroad" if self.gesture_state.mode == "offroad" else "offroad"
                     self.gesture_state.last_event = f"MODE {self.gesture_state.mode.upper()}"
-                    self._send_raw_command("MODE_TOGGLE")
+                    self._send_raw_command(f"MODE_{self.gesture_state.mode.upper()}")
                     logger.info(f"Mode toggle: {self.gesture_state.mode}")
                 elif key in (ord('e'), ord('E')):
                     self.drive_state.enabled = not self.drive_state.enabled

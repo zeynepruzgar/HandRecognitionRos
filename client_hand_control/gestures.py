@@ -248,7 +248,11 @@ class GestureState:
         if self._edge("mode", l_idx and r_idx, dt, self.trigger_hold):
             self.mode = MODE_ONROAD if self.mode == MODE_OFFROAD else MODE_OFFROAD
             self.last_event = f"MODE {self.mode.upper()}"
-            commands.append("MODE_TOGGLE")
+            # ABSOLUTE mode command, not a relative toggle. A dropped UDP packet
+            # would desync a toggle (client thinks offroad, rover still onroad ->
+            # CMD_W latches and never stops). Sending the explicit target keeps
+            # the two in sync regardless of drops.
+            commands.append(f"MODE_{self.mode.upper()}")
 
         # START/STOP autonomy: both fists. Distinct from open palms (arming),
         # thumbs-up (mode), and pointing (lane), so no cross-fire. The rover
