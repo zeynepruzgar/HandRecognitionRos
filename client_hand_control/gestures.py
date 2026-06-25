@@ -26,6 +26,8 @@ from .hand_control import (
     thumb_openness_01,
     INDEX_MCP,
     INDEX_TIP,
+    THUMB_MCP,
+    THUMB_TIP,
 )
 
 MODE_ONROAD = "onroad"    # automatic with assistance (ADAS) — the rover drives itself
@@ -75,6 +77,73 @@ def pointing_direction(lm, dx_thresh: float) -> Optional[str]:
     return None
 
 
+def is_thumb_up_vertical(lm, fist_thresh: float, open_thresh: float) -> bool:
+    """Thumbs-UP: folded hand + thumb extended AND pointing up (vertical).
+
+    Plain is_thumb_up is direction-agnostic, so a sideways thumb (the lane-change
+    pose) also passes it and cross-fires the mode toggle. Requiring the thumb to
+    be more vertical than horizontal — and pointing up (tip above knuckle; image
+    y grows downward, so dy < 0) — keeps MODE (both thumbs up) cleanly separate
+    from LANE (one thumb sideways).
+    """
+    if not is_thumb_up(lm, fist_thresh, open_thresh):
+        return False
+    dx = lm[THUMB_TIP].x - lm[THUMB_MCP].x
+    dy = lm[THUMB_TIP].y - lm[THUMB_MCP].y
+    return abs(dy) > abs(dx) and dy < 0
+
+
+def is_index_up(lm, fist_thresh: float) -> bool:
+    """Index finger extended and pointing UP, other fingers folded.
+
+    Used for the MODE toggle (both index fingers up). Cleanly separable from the
+    lane pose (thumb sideways over a fist -> index FOLDED) and from RUN (fist ->
+    index folded), so it never cross-fires with them. The thumb is free here, so
+    a natural pointing-up hand counts regardless of thumb position. Image y grows
+    downward, so pointing up means tip above knuckle (dy < 0), and we require it
+    to be more vertical than horizontal to reject a sideways point.
+    """
+    fingers = per_finger_openness(lm)
+    if fingers["index"] < 0.6:
+        return False
+    if any(fingers[f] > fist_thresh for f in ("middle", "ring", "pinky")):
+        return False
+    dx = lm[INDEX_TIP].x - lm[INDEX_MCP].x
+    dy = lm[INDEX_TIP].y - lm[INDEX_MCP].y
+    return abs(dy) > abs(dx) and dy < 0
+
+
+def thumb_direction(lm, dx_thresh: float, fist_thresh: float, open_thresh: float) -> Optional[str]:
+    """Thumb extended SIDEWAYS over a folded hand -> 'left' / 'right' / None.
+
+    Lane-change pose: make a fist but stick the thumb out horizontally. Direction
+    is the thumb vector (knuckle -> tip) in x. Landmarks come from an already-
+    mirrored frame (main flips horizontally), so larger x = screen right.
+
+    Kept distinct from MODE (both thumbs UP) by requiring the thumb to be more
+    horizontal than vertical (|dx| > |dy|): a vertical thumbs-up never counts as a
+    lane point, and a lane point needs only ONE hand while MODE needs both.
+    """
+    fingers = per_finger_openness(lm)
+    # All four fingers folded (fist-like), thumb sticking out.
+    if any(v > fist_thresh for v in fingers.values()):
+        return None
+    if thumb_openness_01(lm) < open_thresh:
+        return None
+    dx = lm[THUMB_TIP].x - lm[THUMB_MCP].x
+    dy = lm[THUMB_TIP].y - lm[THUMB_MCP].y
+    # Require a clearly HORIZONTAL thumb. A relaxed/resting hand in onroad easily
+    # produces a diagonal thumb, so loosening this caused spurious CMD_A/CMD_D
+    # that stuck the rover in a lane change and broke lane-following.
+    if abs(dx) < abs(dy):
+        return None
+    if dx <= -dx_thresh:
+        return "left"
+    if dx >= dx_thresh:
+        return "right"
+    return None
+
+
 # ============================================================================
 # State machine
 # ============================================================================
@@ -90,7 +159,9 @@ class GestureState:
         trigger_hold: float = 0.30,
     ):
         # Command state (the stuff that rides in the control message).
-        self.mode = MODE_OFFROAD   # safe default: manual
+        # Default ON_ROAD to match the rover's own default (purePursuit starts in
+        # ON_ROAD); otherwise a mode-toggle would flip the two out of sync.
+        self.mode = MODE_ONROAD
         self.run = False           # onroad autonomy start/stop. Starts DISABLED.
         self.estop = False         # set from the keyboard (main.py), cleared on re-arm
 
@@ -106,6 +177,11 @@ class GestureState:
         self.open_thresh = open_thresh    # thumb extension above this = "up"
         self.point_dx = point_dx          # min index x-deflection to count as a point
         self.trigger_hold = trigger_hold  # hold time before a normal pose fires
+        # Lane-change (thumb sideways) is more forgiving than MODE's thumbs-up: a
+        # sideways thumb reads as less "extended" than a vertical one, so use a
+        # lower threshold here.
+        self.lane_thumb_open = 0.40
+        self.lane_dx = 0.03               # min thumb x-deflection for a lane point
 
         # Per-gesture edge state: a pose must be held `hold` seconds to fire, then
         # is suppressed until released. That's what makes one pose = one command
@@ -137,43 +213,62 @@ class GestureState:
             rearmed: True on the frame the drive was (re-)armed via the existing
                 both-palms-open gesture. Re-arming clears a latched e-stop, so we
                 don't need a separate "unstop" pose.
+
+        Returns a dict that includes "commands": the list of raw string commands
+        the rover understands (MODE_TOGGLE / CMD_W / CMD_S / CMD_A / CMD_D) that
+        fired this frame. main.py forwards these over UDP. They're one-shot per
+        pose, matching the rover's latching behaviour: a command keeps the rover
+        doing its thing until the next command arrives.
         """
         # Re-arm clears the latch. Done first so a same-frame fist can't immediately
         # re-trip it (you'd have to release and re-fist).
         if rearmed:
             self.estop = False
 
+        commands: list = []
+
         l_lm = left[0].landmark if left else None
         r_lm = right[0].landmark if right else None
 
-        # MODE toggle: both thumbs up.
-        l_thumb = l_lm is not None and is_thumb_up(l_lm, self.fist_thresh, self.open_thresh)
-        r_thumb = r_lm is not None and is_thumb_up(r_lm, self.fist_thresh, self.open_thresh)
-        if self._edge("mode", l_thumb and r_thumb, dt, self.trigger_hold):
+        # LANE poses first (single hand, sideways thumb). Either hand can signal;
+        # direction (not which hand) decides, which removes the "wrong hand" failure
+        # and the mirrored-frame ambiguity. We compute these up front so the mode
+        # gesture can be suppressed whenever a lane pose is present.
+        l_dir = thumb_direction(l_lm, self.lane_dx, self.fist_thresh, self.lane_thumb_open) if l_lm is not None else None
+        r_dir = thumb_direction(r_lm, self.lane_dx, self.fist_thresh, self.lane_thumb_open) if r_lm is not None else None
+        point_left = (l_dir == "left") or (r_dir == "left")
+        point_right = (l_dir == "right") or (r_dir == "right")
+        lane_active = point_left or point_right
+
+        # MODE toggle: both INDEX fingers up. Cleanly distinct from the lane pose
+        # (thumb sideways over a fist -> index folded) and from RUN (fist -> index
+        # folded), so no cross-fire and no need to lock it out against lane.
+        l_idx = l_lm is not None and is_index_up(l_lm, self.fist_thresh)
+        r_idx = r_lm is not None and is_index_up(r_lm, self.fist_thresh)
+        if self._edge("mode", l_idx and r_idx, dt, self.trigger_hold):
             self.mode = MODE_ONROAD if self.mode == MODE_OFFROAD else MODE_OFFROAD
             self.last_event = f"MODE {self.mode.upper()}"
+            commands.append("MODE_TOGGLE")
 
         # START/STOP autonomy: both fists. Distinct from open palms (arming),
-        # thumbs-up (mode), and pointing (lane), so no cross-fire.
+        # thumbs-up (mode), and pointing (lane), so no cross-fire. The rover
+        # latches on CMD_W (keep going) and stops on CMD_S.
         l_fist = l_lm is not None and is_fist(l_lm, self.fist_thresh, self.open_thresh)
         r_fist = r_lm is not None and is_fist(r_lm, self.fist_thresh, self.open_thresh)
         if self._edge("run", l_fist and r_fist, dt, self.trigger_hold):
             self.run = not self.run
             self.last_event = f"RUN {'ON' if self.run else 'OFF'}"
+            commands.append("CMD_W" if self.run else "CMD_S")
 
-        # LANE change events: only meaningful on-road (off-road manual has no lanes).
-        if self.mode == MODE_ONROAD:
-            l_left = l_lm is not None and pointing_direction(l_lm, self.point_dx) == "left"
-            if self._edge("lane_left", l_left, dt, self.trigger_hold):
-                self._emit_lane_change("left")
-            r_right = r_lm is not None and pointing_direction(r_lm, self.point_dx) == "right"
-            if self._edge("lane_right", r_right, dt, self.trigger_hold):
-                self._emit_lane_change("right")
-        else:
-            # Keep edge state reset so flipping back to on-road doesn't insta-fire
-            # a lane change from a pose that was already being held.
-            self._edge("lane_left", False, dt, self.trigger_hold)
-            self._edge("lane_right", False, dt, self.trigger_hold)
+        # LANE change events. The rover only acts on these in ON_ROAD while moving,
+        # so we let it be the authority and don't gate on our local mode here — that
+        # way a dropped MODE_TOGGLE packet can't desync us into swallowing them.
+        if self._edge("lane_left", point_left, dt, self.trigger_hold):
+            self._emit_lane_change("left")
+            commands.append("CMD_A")
+        if self._edge("lane_right", point_right, dt, self.trigger_hold):
+            self._emit_lane_change("right")
+            commands.append("CMD_D")
 
         return {
             "mode": self.mode,
@@ -181,6 +276,7 @@ class GestureState:
             "lane_change": self.lane_change,
             "lane_seq": self.lane_seq,
             "estop": self.estop,
+            "commands": commands,
         }
 
     def _emit_lane_change(self, direction: str) -> None:

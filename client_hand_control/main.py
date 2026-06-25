@@ -35,7 +35,6 @@ from .hand_control import (
     check_both_hands_open,
 )
 from .gestures import GestureState
-from .message import ControlMessage, MessageValidator, create_control_message
 from .udp_publisher import UdpPublisher
 
 # Configure logging
@@ -105,7 +104,6 @@ class HandControlClient:
         # extension above this counts as "thumb out" (thumbs-up, and the line that
         # separates a fist from a thumbs-up). See is_fist/is_thumb_up in gestures.py.
         self.gesture_state = GestureState(fist_thresh=0.35, open_thresh=0.55)
-        self.validator = MessageValidator()
         self.publisher: Optional[UdpPublisher] = None
         
         # Camera
@@ -121,13 +119,20 @@ class HandControlClient:
         self._send_interval = 1.0 / rate
         self._force_stop_sent = False
 
-        # UI font
+        # UI font + HUD scale. Bump hud_scale to make all overlay text bigger.
         self.font = cv2.FONT_HERSHEY_SIMPLEX
+        self.hud_scale = 1.8
 
         # Keyboard state. Single input path: cv2.waitKey in the preview loop.
         # (pynput was removed — it duplicated every keypress and needs macOS
         # accessibility perms. Click the preview window to give it focus.)
         self._last_key_pressed = None
+
+    def _hud(self, frame, text, pos, scale, color, thick=2):
+        """Draw overlay text scaled by self.hud_scale (anti-aliased)."""
+        s = scale * self.hud_scale
+        t = max(1, int(round(thick * self.hud_scale)))
+        cv2.putText(frame, text, pos, self.font, s, color, t, cv2.LINE_AA)
 
     def _send_raw_command(self, cmd: str):
         """Send a raw command string directly to the rover."""
@@ -164,9 +169,9 @@ class HandControlClient:
         logger.info("Stopping Hand Control Client...")
         self._running = False
 
-        # Send a final STOP, then shut the publisher down.
+        # Send a final STOP (raw string the rover understands), then shut down.
         if self.publisher:
-            self.publisher.publish(ControlMessage.stop_message().to_json())
+            self.publisher.publish("CMD_S")
             self.publisher.stop()
 
         # Clean up camera
@@ -216,6 +221,11 @@ class HandControlClient:
                     # vision e-stop fails exactly when vision fails.
                     self.gesture_state.estop = not self.gesture_state.estop
                     self.gesture_state.last_event = "E-STOP" if self.gesture_state.estop else "E-STOP CLEARED"
+                    if self.gesture_state.estop:
+                        # Actually stop the rover, not just our local flag. This
+                        # rover has no ESTOP command; CMD_S stops it in ON_ROAD.
+                        self.gesture_state.run = False
+                        self._send_raw_command("CMD_S")
                     logger.warning(f"E-STOP {'ENGAGED' if self.gesture_state.estop else 'RELEASED'} (keyboard)")
                 elif key in (ord('m'), ord('M')):
                     # M = mode toggle (ON_ROAD <-> OFF_ROAD)
@@ -240,13 +250,9 @@ class HandControlClient:
                     self._send_raw_command("CMD_S")
                 elif key == ord('d'):
                     self._send_raw_command("CMD_D")
-                elif key == 82:  # Up arrow
-                    self._send_raw_command("LANE_LEFT")
-                elif key == 84:  # Down arrow
-                    self._send_raw_command("LANE_RIGHT")
-                elif key == 81:  # Left arrow
+                elif key in (82, 81):  # Up / Left arrow -> lane left
                     self._send_raw_command("CMD_A")
-                elif key == 83:  # Right arrow
+                elif key in (84, 83):  # Down / Right arrow -> lane right
                     self._send_raw_command("CMD_D")
                     
             # Rate limiting
@@ -304,7 +310,12 @@ class HandControlClient:
         rearmed = self.drive_state.enabled and not prev_enabled
 
         # ====== DISCRETE GESTURE COMMANDS (mode / lane / e-stop) ======
-        self.gesture_state.update(left, right, dt, rearmed=rearmed)
+        gesture_result = self.gesture_state.update(left, right, dt, rearmed=rearmed)
+        # Forward any fired gesture as a raw string command the rover understands
+        # (MODE_TOGGLE / CMD_W / CMD_S / CMD_A / CMD_D). This is the ONLY thing the
+        # rover acts on — it parses plain strings, not JSON.
+        for cmd in gesture_result.get("commands", []):
+            self._send_raw_command(cmd)
         
         # ====== HAND QUALITY GATE + CONTROL COMPUTATION ======
         lost_active = self.drive_state.handle_visibility(hands_ok, dt)
@@ -346,11 +357,10 @@ class HandControlClient:
             if not lost_active:
                 self.drive_state.smooth_and_quantize(0.0, 0.0, dt)
                 
-        # ====== SEND CONTROL MESSAGE ======
-        # Only send at configured rate
-        if now - self._last_send_time >= self._send_interval:
-            await self._send_control_message(hands_ok, lost_active)
-            self._last_send_time = now
+        # NOTE: there is no periodic message stream. The rover acts on discrete
+        # string commands only (sent above on gesture edges, and from the keyboard).
+        # In ON_ROAD the rover latches — CMD_W keeps it lane-following until CMD_S,
+        # so re-sending state every frame would just re-trigger lane changes.
             
         # ====== PREVIEW DISPLAY ======
         if self.show_preview:
@@ -358,26 +368,12 @@ class HandControlClient:
                              both_open, hands_ok, calib_info, lost_active)
             cv2.imshow("Hand Control Client", frame)
             
-    async def _send_control_message(self, hands_ok: bool, lost_active: bool) -> None:
-        """Create and send a control message. Just the run flag."""
-        # Send run=True only if gesture is active; otherwise omit (send False, actually, always send)
-        msg = create_control_message(run=self.gesture_state.run)
-
-        # Validate (minimal validation)
-        clamped_msg, valid, reason = self.validator.clamp_and_validate(msg)
-
-        if not valid:
-            logger.warning(f"Message validation failed: {reason}")
-            return
-
-        # Publish message
-        json_str = clamped_msg.to_json()
-        logger.debug(f"Sending: {json_str}")
-        if self.publisher and self.publisher.publish(json_str):
-            self._force_stop_sent = False
-
     async def _send_force_stop(self) -> None:
-        """Send force stop message due to frame quality issues."""
+        """Stop the rover due to frame quality issues (dead/corrupted camera).
+
+        The rover only understands raw string commands and has no ESTOP, so we
+        send CMD_S — the stop it acts on in ON_ROAD.
+        """
         if self._force_stop_sent:
             return
 
@@ -386,13 +382,11 @@ class HandControlClient:
         # Force drive state to stop
         self.drive_state.force_stop()
         self.drive_state.enabled = False
+        self.gesture_state.run = False
 
-        # Create and publish stop message
-        msg = ControlMessage.stop_message()
-
-        if self.publisher and self.publisher.publish(msg.to_json()):
+        if self.publisher and self.publisher.publish("CMD_S"):
             self._force_stop_sent = True
-            logger.info("Force stop message sent")
+            logger.info("Force stop (CMD_S) sent")
                 
     def _init_camera(self) -> bool:
         """Initialize video capture."""
@@ -452,26 +446,28 @@ class HandControlClient:
         else:
             color = (0, 255, 0) if self.drive_state.enabled else (0, 0, 255)
             
-        cv2.putText(frame, status, (20, 40), self.font, 0.9, color, 2)
+        self._hud(frame, status, (20, 55), 0.5, color)
         
         # UDP target status. Note: UDP is connectionless — "Ready" just means the
         # socket is open, NOT that the rover is actually receiving. There's no ack.
         conn_status = "Ready" if (self.publisher and self.publisher.connected) else "Down"
         conn_color = (0, 255, 0) if conn_status == "Ready" else (0, 0, 255)
-        cv2.putText(frame, f"Robot {self.host}:{self.port} [{conn_status}]", (20, 70), self.font, 0.5, conn_color, 1)
+        self._hud(frame, f"Robot {self.host}:{self.port} [{conn_status}]", (20, 100), 0.32, conn_color)
 
         # Discrete-gesture state: mode / run / lane / e-stop
         gs = self.gesture_state
         mode_color = (0, 200, 255) if gs.mode == "onroad" else (180, 180, 180)
-        cv2.putText(frame, f"Mode: {gs.mode.upper()}", (20, 100), self.font, 0.5, mode_color, 1)
+        self._hud(frame, f"Mode: {gs.mode.upper()}", (20, 150), 0.5, mode_color)
 
         run_color = (0, 255, 0) if gs.run else (0, 0, 255)
-        cv2.putText(frame, f"RUN: {'ON' if gs.run else 'OFF'}", (20, 125), self.font, 0.5, run_color, 1)
+        self._hud(frame, f"RUN: {'ON' if gs.run else 'OFF'}", (20, 200), 0.5, run_color)
 
         # Gesture detection debug: show what poses are detected
         if hands_ok and left and right:
-            from .gestures import is_fist, is_thumb_up
-            from .hand_control import hand_openness_01, thumb_openness_01
+            from .gestures import is_fist, is_thumb_up, is_index_up, thumb_direction
+            from .hand_control import (
+                hand_openness_01, thumb_openness_01, THUMB_MCP, THUMB_TIP,
+            )
             l_lm = left[0].landmark
             r_lm = right[0].landmark
 
@@ -484,102 +480,72 @@ class HandControlClient:
             r_fist = is_fist(r_lm, gs.fist_thresh, gs.open_thresh)
             l_thumb = is_thumb_up(l_lm, gs.fist_thresh, gs.open_thresh)
             r_thumb = is_thumb_up(r_lm, gs.fist_thresh, gs.open_thresh)
+            l_idx = is_index_up(l_lm, gs.fist_thresh)
+            r_idx = is_index_up(r_lm, gs.fist_thresh)
 
-            gesture_text = f"L:{'F' if l_fist else 'T' if l_thumb else '.'} R:{'F' if r_fist else 'T' if r_thumb else '.'}"
-            cv2.putText(frame, gesture_text, (w - 150, 30), self.font, 0.6, (200, 200, 200), 1)
+            def _tag(fist, idx, thumb):
+                return 'F' if fist else 'I' if idx else 'T' if thumb else '.'
+
+            gesture_text = f"L:{_tag(l_fist, l_idx, l_thumb)} R:{_tag(r_fist, r_idx, r_thumb)}  (II=mode)"
+            self._hud(frame, gesture_text, (w - 280, 55), 0.45, (200, 200, 200))
 
             # Show actual values
             openness_text = f"L: {l_open:.2f} ({l_thumb_open:.2f}) R: {r_open:.2f} ({r_thumb_open:.2f})"
-            cv2.putText(frame, openness_text, (w - 300, 50), self.font, 0.4, (150, 150, 150), 1)
+            self._hud(frame, openness_text, (w - 520, 100), 0.3, (150, 150, 150))
 
             # Show thresholds
             thresh_text = f"Fist<{gs.fist_thresh:.2f} Thumb>{gs.open_thresh:.2f}"
-            cv2.putText(frame, thresh_text, (w - 300, 65), self.font, 0.4, (100, 100, 100), 1)
+            self._hud(frame, thresh_text, (w - 520, 135), 0.3, (100, 100, 100))
+
+            # Lane (thumb-sideways) debug: per-hand thumb dx/dy + detected dir.
+            l_dir = thumb_direction(l_lm, gs.lane_dx, gs.fist_thresh, gs.lane_thumb_open)
+            r_dir = thumb_direction(r_lm, gs.lane_dx, gs.fist_thresh, gs.lane_thumb_open)
+            l_dxy = (l_lm[THUMB_TIP].x - l_lm[THUMB_MCP].x, l_lm[THUMB_TIP].y - l_lm[THUMB_MCP].y)
+            r_dxy = (r_lm[THUMB_TIP].x - r_lm[THUMB_MCP].x, r_lm[THUMB_TIP].y - r_lm[THUMB_MCP].y)
+            lane_color = (0, 255, 0) if (l_dir or r_dir) else (120, 120, 120)
+            self._hud(frame, f"LANE L[{l_dir or '-'}] R[{r_dir or '-'}]", (w - 520, 175), 0.35, lane_color)
+            self._hud(frame, f"Ldx{l_dxy[0]:+.2f} dy{l_dxy[1]:+.2f} to{l_thumb_open:.2f}", (w - 520, 210), 0.3, (150, 150, 150))
+            self._hud(frame, f"Rdx{r_dxy[0]:+.2f} dy{r_dxy[1]:+.2f} to{r_thumb_open:.2f}", (w - 520, 245), 0.3, (150, 150, 150))
 
         # Lane change state
         if gs.lane_change:
             lane_text = f"Lane: {gs.lane_change.upper()} (seq={gs.lane_seq})"
-            cv2.putText(frame, lane_text, (20, 145), self.font, 0.5, (255, 200, 0), 1)
+            self._hud(frame, lane_text, (20, 250), 0.42, (255, 200, 0))
 
         if gs.estop:
             # Loud, centered banner — this is the one you must not miss.
-            cv2.putText(frame, "*** E-STOP ***", (w // 2 - 120, 50), self.font, 1.0, (0, 0, 255), 3)
+            self._hud(frame, "*** E-STOP ***", (w // 2 - 220, 80), 1.0, (0, 0, 255), 3)
 
         if gs.last_event:
-            cv2.putText(frame, gs.last_event, (20, 170), self.font, 0.5, (0, 255, 0), 1)
+            self._hud(frame, gs.last_event, (20, 300), 0.42, (0, 255, 0))
         
         # Keyboard display
         if self._last_key_pressed:
-            cv2.putText(
-                frame,
-                f"Key: {self._last_key_pressed}",
-                (20, h - 160),
-                self.font, 0.7, (255, 165, 0), 2
-            )
+            self._hud(frame, f"Key: {self._last_key_pressed}", (20, h - 200), 0.5, (255, 165, 0))
 
         # Command display
         linear, angular = self.drive_state.get_velocity_commands(self.max_linear, self.max_angular)
-        cv2.putText(
-            frame,
-            f"Linear: {linear:+.3f} m/s",
-            (20, h - 70),
-            self.font, 0.7, (255, 0, 0), 2
-        )
-        cv2.putText(
-            frame,
-            f"Angular: {angular:+.3f} rad/s",
-            (20, h - 40),
-            self.font, 0.7, (0, 255, 255), 2
-        )
+        self._hud(frame, f"Linear: {linear:+.3f} m/s", (20, h - 90), 0.45, (255, 0, 0))
+        self._hud(frame, f"Angular: {angular:+.3f} rad/s", (20, h - 40), 0.45, (0, 255, 255))
         
         # Status messages
         if calib_info.get('calibrating'):
             progress = int(calib_info.get('progress', 0) * 100)
-            cv2.putText(
-                frame,
-                f"Calibrating... {progress}%",
-                (20, h - 100),
-                self.font, 0.6, (0, 200, 0), 2
-            )
+            self._hud(frame, f"Calibrating... {progress}%", (20, h - 145), 0.42, (0, 200, 0))
         elif self.drive_state.calib_requested:
-            cv2.putText(
-                frame,
-                "Hold both hands still to calibrate",
-                (20, h - 100),
-                self.font, 0.6, (0, 165, 255), 2
-            )
+            self._hud(frame, "Hold both hands still to calibrate", (20, h - 145), 0.42, (0, 165, 255))
         elif self.drive_state.baseline is None:
-            cv2.putText(
-                frame,
-                "Show both hands to calibrate",
-                (20, h - 100),
-                self.font, 0.6, (0, 165, 255), 2
-            )
+            self._hud(frame, "Show both hands to calibrate", (20, h - 145), 0.42, (0, 165, 255))
         elif lost_active:
-            cv2.putText(
-                frame,
-                "SAFE STOP (hands lost)",
-                (20, h - 100),
-                self.font, 0.6, (0, 0, 255), 2
-            )
+            self._hud(frame, "SAFE STOP (hands lost)", (20, h - 145), 0.42, (0, 0, 255))
         elif not hands_ok:
-            cv2.putText(
-                frame,
-                "Need both hands visible",
-                (20, h - 100),
-                self.font, 0.6, (0, 165, 255), 2
-            )
+            self._hud(frame, "Need both hands visible", (20, h - 145), 0.42, (0, 165, 255))
             
         # Frame gate stats
         fg_stats = self.frame_gate.get_stats()
         if fg_stats['invalid_frames'] > 0:
             invalid_pct = fg_stats['invalid_frames'] / max(fg_stats['total_frames'], 1) * 100
-            cv2.putText(
-                frame,
-                f"Frame errors: {invalid_pct:.1f}%",
-                (w - 200, 30),
-                self.font, 0.5, (0, 0, 255), 1
-            )
+            self._hud(frame, f"Frame errors: {invalid_pct:.1f}%", (w - 280, 290), 0.35, (0, 0, 255))
 
 
 async def main_async(args: argparse.Namespace) -> None:
