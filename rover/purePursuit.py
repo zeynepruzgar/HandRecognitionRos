@@ -5,6 +5,7 @@ import time
 import math
 import socket
 import os
+import threading
 
 # ---------------------------------------------------------
 # 1. CAMERA MANAGER
@@ -260,6 +261,9 @@ class Communicator:
         self.port_name = port_name
         self.baud_rate = baud_rate
         self.is_connected = False
+        # Seri porta hem ana döngü hem keep-alive thread'i yazıyor; yazımları
+        # kilitleyerek paketlerin iç içe geçip bozulmasını engelliyoruz.
+        self.write_lock = threading.Lock()
         try:
             self.serial_connection = serial.Serial(self.port_name, self.baud_rate, timeout=0.1)
             self.is_connected = True
@@ -283,13 +287,15 @@ class Communicator:
     def send_ang_vel(self, ang_vel):
         if self.is_connected:
             packet = f"L:{ang_vel:.1f}\n"
-            self.serial_connection.write(packet.encode('utf-8'))
+            with self.write_lock:
+                self.serial_connection.write(packet.encode('utf-8'))
 
     def send_direct_command(self, cmd_str):
         """Arduino'ya doğrudan ILERI, GERI, DUR gibi metin komutları yollar."""
         if self.is_connected:
             packet = f"{cmd_str}\n"
-            self.serial_connection.write(packet.encode('utf-8'))
+            with self.write_lock:
+                self.serial_connection.write(packet.encode('utf-8'))
 
     def read_telemetry(self):
         if self.is_connected and self.serial_connection.in_waiting > 0:
@@ -299,8 +305,9 @@ class Communicator:
     def send_emergency_stop(self):
         if self.is_connected:
             try:
-                self.serial_connection.write("DUR\n".encode('utf-8'))
-                self.serial_connection.flush() 
+                with self.write_lock:
+                    self.serial_connection.write("DUR\n".encode('utf-8'))
+                    self.serial_connection.flush() 
                 time.sleep(0.2)
                 self.serial_connection.close()
                 self.is_connected = False
@@ -327,8 +334,8 @@ class Communicator:
 class Rover:
     def __init__(self):
         self.camera = CameraManager(width=640, height=480)
-        self.tracker = LaneTracker(px_to_cm_x=0.0656, px_to_cm_y=0.09375, mechanical_offset_y=29.5)
-        self.controller = PurePursuitController(steering_gain=130.0, max_angular_vel=90.0)
+        self.tracker = LaneTracker(px_to_cm_x=0.0656, px_to_cm_y=0.09375, mechanical_offset_y=32.8)
+        self.controller = PurePursuitController(steering_gain=200.0, max_angular_vel=90.0)
         self.communicator = Communicator(port_name="/dev/ttyUSB0", baud_rate=115200, udp_port=5001)
 
         self.system_state = "RUNNING"
@@ -336,6 +343,14 @@ class Rover:
         self.mode = "ON_ROAD"
         self.is_moving = False
         self.obstacle_count = 0
+        # Engel algılama: Arduino'dan gelen ultrasonik mesafe (cm). ON_ROAD'da
+        # obstacle_stop_cm içine girince araç durur (mod ON_ROAD'da kalır), engel
+        # obstacle_clear_cm'in üstüne çıkınca otomatik devam eder. İki eşik
+        # (histerezis) sınırda dur-kalk titremesini önler. 999 = okuma yok.
+        self.last_distance = 999
+        self.obstacle_stop_cm = 10
+        self.obstacle_clear_cm = 15
+        self.obstacle_blocked = False
         # Watchdog beslemesi: kamera bir kare düşürdüğünde son direksiyon
         # komutunu tekrar yollayıp Arduino'nun 200ms watchdog'unu canlı tutarız
         # (dur-kalk biter). Ama kamera max_blind_ms'den uzun süre kare vermezse
@@ -350,7 +365,9 @@ class Rover:
         #   STREAM_EVERY=N    -> sadece her N. kareyi gönder (encode yükünü düşürür)
         #   VIDEO_TARGET_IP   -> yayının gideceği bilgisayarın IP'si
         target_ip = os.environ.get("VIDEO_TARGET_IP", "10.42.0.112")
-        self.enable_stream = os.environ.get("ENABLE_STREAM", "1") != "0"
+        # Varsayılan KAPALI: video yayını döngüyü yavaşlatıp dur-kalk yapıyordu.
+        # Sürüş için gerekmez. Video izlemek istersen ENABLE_STREAM=1 ile aç.
+        self.enable_stream = os.environ.get("ENABLE_STREAM", "0") == "1"
         self.stream_every = max(1, int(os.environ.get("STREAM_EVERY", "3")))
         self._frame_idx = 0
         self.combined_w = self.camera.w * 2 
@@ -373,6 +390,25 @@ class Rover:
                 print(f"[BİLGİ] Video yayını açık -> {target_ip}:5000 (her {self.stream_every}. kare)")
         else:
             print("[BİLGİ] Video yayını KAPALI (ENABLE_STREAM=0). En akıcı sürüş modu.")
+
+        # --- WATCHDOG KEEP-ALIVE THREAD ---
+        # Kameranın read() çağrısı bazen kareyi geciktirip ana döngüyü 200ms'den
+        # uzun bloklayabiliyor (otofokus/pipeline takılması). O sırada hiç komut
+        # gidemediği için Arduino watchdog'u motoru kesip dur-kalk yapıyor. Bu
+        # thread, kameradan BAĞIMSIZ olarak son direksiyon komutunu sürekli (~80ms)
+        # gönderip watchdog'u canlı tutar. Kamera max_blind_ms'den uzun ölürse
+        # gönderimi keser -> watchdog devreye girip güvenli durur.
+        self._keepalive_stop = False
+        self._keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
+        self._keepalive_thread.start()
+
+    def _keepalive_loop(self):
+        while not self._keepalive_stop:
+            time.sleep(0.08)  # ~12 Hz; 200ms watchdog'un çok altında
+            if self.mode == "ON_ROAD" and self.is_moving and not self.obstacle_blocked:
+                blind_ms = (time.time() - self.last_valid_frame_time) * 1000
+                if blind_ms < self.max_blind_ms:
+                    self.communicator.send_ang_vel(self.last_ang_vel)
 
     # DÜZELTME: current_action parametresi eklendi
     def stream_to_ubuntu(self, debug_frame, warped_binary, target_x_pixel, ang_vel, current_action):
@@ -420,16 +456,28 @@ class Rover:
         try:
             while self.system_state == "RUNNING":
                 telemetry = self.communicator.read_telemetry()
+                # Arduino "M:<cm>" mesafe telemetrisi gönderiyor; engel kontrolü
+                # için son geçerli mesafeyi sakla (999 = okuma yok).
+                if telemetry and telemetry.startswith("M:"):
+                    try:
+                        self.last_distance = int(telemetry[2:])
+                    except ValueError:
+                        pass
                 display_ang_vel = 0.0 
 
                 cmd = self.communicator.read_udp_command()
                 
                 if cmd:
-                    if cmd == "MODE_TOGGLE":
-                        if self.mode == "ON_ROAD":
-                            self.mode = "OFF_ROAD"
-                        else:
+                    # Mutlak mod komutları (MODE_ONROAD / MODE_OFFROAD) tercih edilir;
+                    # UDP paketi düşse bile client ile rover'ın modu senkron kalır.
+                    # MODE_TOGGLE eski client'lar için geriye dönük uyumluluk.
+                    if cmd in ("MODE_TOGGLE", "MODE_ONROAD", "MODE_OFFROAD"):
+                        if cmd == "MODE_ONROAD":
                             self.mode = "ON_ROAD"
+                        elif cmd == "MODE_OFFROAD":
+                            self.mode = "OFF_ROAD"
+                        else:  # MODE_TOGGLE
+                            self.mode = "OFF_ROAD" if self.mode == "ON_ROAD" else "ON_ROAD"
                         self.is_moving = False  
                         current_offroad_cmd = None
                         print(f"\n[MOD DEĞİŞTİ] Yeni Mod: {self.mode}")
@@ -464,7 +512,7 @@ class Rover:
                     # araç dur-kalk yapmasın. Uzun süre kare gelmezse (kamera
                     # ölmüş) gönderme -> Arduino 200ms watchdog'u ile güvenli dur.
                     blind_ms = (time.time() - self.last_valid_frame_time) * 1000
-                    if self.mode == "ON_ROAD" and self.is_moving and blind_ms < self.max_blind_ms:
+                    if self.mode == "ON_ROAD" and self.is_moving and not self.obstacle_blocked and blind_ms < self.max_blind_ms:
                         self.communicator.send_ang_vel(self.last_ang_vel)
                     time.sleep(0.01)
                     continue
@@ -475,6 +523,26 @@ class Rover:
 
                 # --- ON_ROAD SÜRÜŞ MANTIĞI ---
                 if self.mode == "ON_ROAD" and self.is_moving:
+                    # --- ENGEL DUR/DEVAM (histerezisli) ---
+                    # Engel obstacle_stop_cm içine girince dur; obstacle_clear_cm'in
+                    # ÜSTÜNE çıkınca devam et. İki farklı eşik (histerezis) sınırda
+                    # titremeyi (dur-kalk) önler. Mod ON_ROAD'da kalır, kullanıcı
+                    # tekrar komut vermez; engel kalkınca otomatik devam eder.
+                    if 0 < self.last_distance <= self.obstacle_stop_cm:
+                        if not self.obstacle_blocked:
+                            print(f"[ENGEL] {self.last_distance}cm! Durdu, engel kalkinca devam edecek.")
+                        self.obstacle_blocked = True
+                    elif self.last_distance > self.obstacle_clear_cm:
+                        if self.obstacle_blocked:
+                            print("[ENGEL] Temizlendi, devam ediliyor.")
+                            self.communicator.send_direct_command("ILERI")  # ileri latch'i tazele
+                        self.obstacle_blocked = False
+
+                    if self.obstacle_blocked:
+                        # Dur ama ON_ROAD/is_moving korunur; engel kalkınca devam.
+                        self.communicator.send_direct_command("DUR")
+                        continue
+
                     if current_action == "CHANGE_LEFT":
                         if (self.tracker.prev_left_base is not None) and (self.tracker.prev_left_base > 320):
                             self.tracker.prev_right_base = self.tracker.prev_left_base
@@ -535,6 +603,8 @@ class Rover:
 
     def emergency_stop(self):
         print("\n[BİLGİ] Acil durdurma tetiklendi! Motorlar kilitleniyor...")
+        self._keepalive_stop = True  # keep-alive thread'i durdur, yoksa DUR'u ezer
+        time.sleep(0.12)             # son keep-alive turunun bitmesini bekle
         self.communicator.send_emergency_stop()
         self.system_state = "STOPPED"
         
