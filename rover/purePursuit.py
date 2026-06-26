@@ -348,8 +348,8 @@ class Rover:
         # obstacle_clear_cm'in üstüne çıkınca otomatik devam eder. İki eşik
         # (histerezis) sınırda dur-kalk titremesini önler. 999 = okuma yok.
         self.last_distance = 999
-        self.obstacle_stop_cm = 10
-        self.obstacle_clear_cm = 15
+        self.obstacle_stop_cm = 20
+        self.obstacle_clear_cm = 25
         self.obstacle_blocked = False
         # Watchdog beslemesi: kamera bir kare düşürdüğünde son direksiyon
         # komutunu tekrar yollayıp Arduino'nun 200ms watchdog'unu canlı tutarız
